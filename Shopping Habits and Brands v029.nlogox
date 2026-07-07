@@ -1,0 +1,721 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code><![CDATA[; ============================================================
+; MODEL STATE
+; ============================================================
+
+globals [
+  ; --- runtime state (reset or updated every run/tick) ---
+  total-sales          ; $, cumulative money customers have spent
+  total-profit         ; $, cumulative shop profit net of unit costs
+  brand-sales          ; list, cumulative $ sales per brand
+  brand-profit         ; list, cumulative $ profit per brand
+  daily-units          ; list, units sold per brand during the current day
+  broke-customers      ; customers who wanted to shop but could not afford it
+  brand-names          ; list, display name of each brand
+  ; --- calibration: population and catalog ---
+  num-customers        ; number of shopping agents
+  num-brands           ; number of brands competing in the one category
+  ; --- calibration: prices and discounts ---
+  min-price            ; $, lower bound of brand prices
+  max-price            ; $, upper bound of brand prices
+  cost-share           ; fraction of the price the shop pays per unit
+  brand-discount-rate  ; price cut applied while a brand is on discount
+  ; --- calibration: budgets and baskets ---
+  min-base-budget      ; $, lower bound of an agent's base daily money
+  max-base-budget      ; $, upper bound of an agent's base daily money
+  budget-noise-share   ; relative size of the daily budget fluctuation
+  max-units            ; a purchase is 1..max-units units of the chosen brand
+  ; --- calibration: shopping-frequency habit ---
+  shop-prob-init       ; initial probability a customer shops on a given day
+  shop-gain            ; step up in shop probability after a satisfied trip
+  shop-loss            ; step down after an unmet trip
+  ; --- calibration: habitual vs deliberate choice ---
+  beta-loyalty         ; weight of loyalty score in choice utility
+  beta-price           ; weight of price, used only when deliberating
+  outside-utility      ; utility of buying nothing
+  deliberation-prob    ; baseline chance of deliberating over habit
+  ; --- calibration: reward-scaled reinforcement ---
+  reward-neutral       ; satisfaction giving no loyalty change
+  reward-price-weight  ; reward share from price vs. amount bought
+  ; --- calibration: brand loyalty (plain scores) ---
+  min-initial-loyalty  ; lower bound of the initial loyalty scores
+  max-initial-loyalty  ; upper bound of the initial loyalty scores
+  loyalty-gain         ; score step scale for the brand just bought
+  loyalty-decay        ; score step down for its rivals after a good buy
+  loyalty-forget-rate  ; daily fraction by which every score fades to 0
+  ; --- calibration: supply (order-up-to with random lead time) ---
+  order-up-to-level    ; target shelf stock the shop reorders toward
+  max-lead-time        ; ticks, longest random delivery lead time
+  ; --- calibration: run length ---
+  simulation-days      ; ticks, day at which the go button stops
+]
+
+breed [ brands brand ]        ; one brand sold in the category
+breed [ customers customer ]  ; the shopping agents
+
+brands-own [
+  brand-id        ; index 0..num-brands-1, matches the loyalty list position
+  brand-name      ; display name
+  price           ; $, catalog price of one unit
+  cost            ; $, what the shop pays for one unit
+  stock           ; units currently on the shelf
+  on-order        ; units in transit toward the shelf
+  lead-timer      ; ticks until the in-transit order arrives, 0 if none
+  discount-timer  ; ticks left of an active discount, 0 if none
+]
+
+customers-own [
+  base-budget  ; $, personal base amount of daily shopping money
+  wallet       ; $, money left to spend today
+  shop-prob    ; probability this customer shops on a given day
+  loyalties    ; list of loyalty scores, one per brand (index = brand-id)
+]
+
+; ============================================================
+; SETUP
+; ============================================================
+
+to setup
+  clear-all
+  setup-calibration
+  set total-sales 0
+  set total-profit 0
+  set brand-sales n-values num-brands [ 0 ]
+  set brand-profit n-values num-brands [ 0 ]
+  set daily-units n-values num-brands [ 0 ]
+  set broke-customers 0
+  setup-brands
+  setup-customers
+  reset-ticks
+end
+
+; Single source of truth for every tunable coefficient, so BehaviorSpace
+; and sensitivity sweeps can vary the model without touching procedures.
+to setup-calibration
+  ; --- population and catalog ---
+  set num-customers 200
+  set num-brands 8
+  ; --- prices and discounts ---
+  set min-price 1
+  set max-price 10
+  set cost-share 0.7
+  set brand-discount-rate 0.35
+  ; --- budgets and baskets ---
+  set min-base-budget 5
+  set max-base-budget 15
+  set budget-noise-share 0.1
+  set max-units 3
+  ; --- shopping-frequency habit ---
+  set shop-prob-init 0.6
+  set shop-gain 0.1
+  set shop-loss 0.1
+  ; --- habitual vs deliberate choice ---
+  set beta-loyalty 2.5
+  set beta-price 2
+  set outside-utility 1.5
+  set deliberation-prob 0.2
+  ; --- reward-scaled reinforcement ---
+  set reward-neutral 0.5
+  set reward-price-weight 0.7
+  ; --- brand loyalty (plain scores) ---
+  set min-initial-loyalty -0.3
+  set max-initial-loyalty 0.3
+  set loyalty-gain 0.8
+  set loyalty-decay 0.15
+  set loyalty-forget-rate 0.02
+  ; --- supply (order-up-to with random lead time) ---
+  set order-up-to-level 40
+  set max-lead-time 5
+  ; --- run length ---
+  set simulation-days 365
+  set brand-names
+    ["Zappa" "Kova" "Nuvo" "Fizzo" "Blip" "Gusto" "Vibe" "Munch"]
+end
+
+to setup-brands
+  foreach range num-brands [ b ->
+    create-brands 1 [
+      hide-turtle
+      set brand-id b
+      set brand-name item b brand-names
+      set price min-price + random-float (max-price - min-price)
+      set cost price * cost-share
+      set stock random (order-up-to-level + 1)
+      set on-order 0
+      set lead-timer 0
+      set discount-timer 0
+    ]
+  ]
+end
+
+to setup-customers
+  create-customers num-customers [
+    hide-turtle
+    set base-budget min-base-budget +
+      random-float (max-base-budget - min-base-budget)
+    set wallet 0
+    set shop-prob shop-prob-init
+    set loyalties n-values num-brands
+      [ min-initial-loyalty +
+        random-float (max-initial-loyalty - min-initial-loyalty) ]
+  ]
+end
+
+; ============================================================
+; MAIN LOOP
+; ============================================================
+
+; One tick is one shopping day: deliveries arrive, every customer decides
+; whether to shop and (if so) buys and learns, then the shop reorders.
+to go
+  if ticks >= simulation-days [ stop ]
+  set daily-units n-values num-brands [ 0 ]
+  set broke-customers 0
+  ask brands [ receive-delivery ]
+  ask customers [ receive-daily-budget shop ]
+  ask brands [ age-discount place-order ]
+  tick
+end
+
+; ============================================================
+; SUPPLY AND DISCOUNTS
+; ============================================================
+
+to receive-delivery  ; brand procedure
+  if lead-timer > 0 [
+    set lead-timer lead-timer - 1
+    if lead-timer = 0 [
+      set stock stock + on-order
+      set on-order 0
+    ]
+  ]
+end
+
+to place-order  ; brand procedure
+  ; order-up-to policy: one outstanding order, random lead time
+  if lead-timer = 0 and stock < order-up-to-level [
+    set on-order order-up-to-level - stock
+    set lead-timer 1 + random max-lead-time
+  ]
+end
+
+to age-discount  ; brand procedure
+  if discount-timer > 0 [ set discount-timer discount-timer - 1 ]
+end
+
+to discount-brand [ b ]
+  ; a brand button puts that brand on sale for the next discount-days days
+  ask brands with [ brand-id = b ] [ set discount-timer discount-days ]
+end
+
+; ============================================================
+; SHOPPING: THE DECISION
+; ============================================================
+ 
+to receive-daily-budget  ; customer procedure
+  set wallet base-budget * (1 + budget-noise-share * (random-float 2 - 1))
+end
+
+; shop -- one shopping day. With probability shop-prob the customer makes a
+; trip; a satisfying trip raises that probability and an unmet one lowers it
+; (the shopping-frequency habit). Whether or not a trip happens, every
+; loyalty fades a little at the end (habits need repetition to last).
+to shop  ; customer procedure
+  if random-float 1 < shop-prob [ make-trip ]
+  forget-loyalties
+end
+
+to make-trip  ; customer procedure
+  let available brands with [ stock > 0 ]
+  ifelse not any? available [
+    weaken-shop-habit
+  ] [
+    ifelse wallet < min [ effective-price ] of available [
+      set broke-customers broke-customers + 1
+    ] [
+      let chosen choose-brand available
+      ifelse chosen = nobody [ weaken-shop-habit ] [ buy-from chosen ]
+    ]
+  ]
+end
+
+; choose-brand -- the core decision. Habit is the DEFAULT and it is model-
+; free: the softmax weight of each in-stock brand comes from its loyalty
+; score alone. On a minority of occasions the customer DELIBERATES and
+; price also enters (see deliberating?). A no-buy option always competes.
+; One option is drawn in proportion to its weight; nobody means no purchase.
+to-report choose-brand [ available ]  ; customer reporter
+  let deliberate? deliberating? available
+  let options lput nobody (sort available)
+  let weights map [ o -> option-weight o deliberate? ] options
+  report weighted-pick options weights
+end
+
+to-report option-weight [ o deliberate? ]  ; customer reporter
+  ; o is an in-stock brand, or nobody for the no-buy option
+  if o = nobody [ report exp outside-utility ]
+  let u beta-loyalty * item ([ brand-id ] of o) loyalties
+  if deliberate? [ set u u + beta-price * [ price-satisfaction ] of o ]
+  report exp u
+end
+
+; deliberating? -- the exploration trigger. Deliberation fires with a small
+; baseline probability, and always when the customer's usual brand (its
+; highest-loyalty brand) is out of stock, because the broken cue forces a
+; fresh comparison.
+to-report deliberating? [ available ]  ; customer reporter
+  let usual usual-brand
+  if any? available with [ brand-id = usual ] [
+    report random-float 1 < deliberation-prob
+  ]
+  report true
+end
+
+to-report usual-brand  ; customer reporter
+  ; brand-id of the highest-loyalty brand - this customer's favourite
+  report position (max loyalties) loyalties
+end
+
+to-report weighted-pick [ items weights ]
+  ; return one item chosen with probability proportional to its weight
+  let target random-float sum weights
+  let cum 0
+  let i 0
+  foreach items [ it ->
+    set cum cum + item i weights
+    if target < cum [ report it ]
+    set i i + 1
+  ]
+  report last items
+end
+
+; ============================================================
+; LEARNING: PURCHASE, REINFORCEMENT, FORGETTING
+; ============================================================
+
+; buy-from -- the customer buys 1..max-units units of the chosen brand,
+; stopping early if the shelf empties or the wallet runs dry, tallying the
+; takings as it goes. Getting the wanted amount is a satisfying trip; a
+; short one is not. A purchase then reinforces the brand in proportion to
+; how rewarding it was.
+to buy-from [ chosen ]  ; customer procedure
+  let desired 1 + random max-units
+  let bought 0
+  while [ bought < desired
+          and [ stock ] of chosen > 0
+          and wallet >= [ effective-price ] of chosen ] [
+    let paid [ effective-price ] of chosen
+    let b [ brand-id ] of chosen
+    let unit-profit paid - [ cost ] of chosen
+    set wallet wallet - paid
+    set total-sales total-sales + paid
+    set total-profit total-profit + unit-profit
+    set brand-sales replace-item b brand-sales (item b brand-sales + paid)
+    set brand-profit
+      replace-item b brand-profit (item b brand-profit + unit-profit)
+    set daily-units replace-item b daily-units (item b daily-units + 1)
+    ask chosen [ set stock stock - 1 ]
+    set bought bought + 1
+  ]
+  ifelse bought >= desired [ strengthen-shop-habit ] [ weaken-shop-habit ]
+  if bought >= 1 [ reinforce chosen (purchase-reward chosen bought desired) ]
+end
+
+; purchase-reward -- how satisfying the purchase was, in [0,1]: a blend of
+; how cheap the brand was and how much of the wanted amount was bought.
+to-report purchase-reward [ the-brand bought desired ]  ; customer reporter
+  report reward-price-weight * [ price-satisfaction ] of the-brand
+    + (1 - reward-price-weight) * (bought / desired)
+end
+
+; reinforce -- the chosen brand's score moves by loyalty-gain x (reward -
+; reward-neutral): a satisfying buy raises it, a poor one lowers it. After a
+; satisfying buy the rival brands' scores drop a little, so wins build a
+; lead. This plain score, fed through the softmax in choose-brand, is what
+; produces habit and lock-in - no probabilities or log-odds needed.
+to reinforce [ chosen reward ]  ; customer procedure
+  let b [ brand-id ] of chosen
+  set loyalties replace-item b loyalties
+    (item b loyalties + loyalty-gain * (reward - reward-neutral))
+  if reward >= reward-neutral [
+    foreach range num-brands [ other1 ->
+      if other1 != b [ set loyalties replace-item other1 loyalties (item other1 loyalties - loyalty-decay) ]
+    ]
+  ]
+end
+
+to forget-loyalties  ; customer procedure
+  ; every score fades toward 0 (equal preference) unless it is renewed
+  set loyalties map [ s -> s * (1 - loyalty-forget-rate) ] loyalties
+end
+
+to strengthen-shop-habit  ; customer procedure
+  set shop-prob shop-prob + shop-gain * (1 - shop-prob)
+end
+
+to weaken-shop-habit  ; customer procedure
+  set shop-prob shop-prob - shop-loss * shop-prob
+end
+
+; ============================================================
+; REPORTERS (plots and monitors)
+; ============================================================
+
+to-report effective-price  ; brand procedure
+  report ifelse-value discount-timer > 0
+    [ price * (1 - brand-discount-rate) ]
+    [ price ]
+end
+
+to-report price-satisfaction  ; brand procedure
+  ; absolute: cheapest price gives 1, dearest gives 0
+  report clamp01 ((max-price - effective-price) / (max-price - min-price))
+end
+
+to-report clamp01 [ x ]
+  report max list 0 (min list 1 x)
+end
+
+to-report brand-share [ b ]
+  ; percent of today's units that were brand b
+  let total sum daily-units
+  report ifelse-value total > 0 [ item b daily-units / total * 100 ] [ 0 ]
+end
+
+to-report bar-color [ the-brand ]
+  ; on-sale brands stand out in magenta; the rest are grey
+  report ifelse-value [ discount-timer ] of the-brand > 0 [ magenta ] [ grey ]
+end
+
+to-report brands-on-sale
+  ; names and days-left of every brand currently discounted, for a monitor
+  let sale sort brands with [ discount-timer > 0 ]
+  if empty? sale [ report "none" ]
+  report reduce [ [ a b ] -> (word a "    " b) ]
+    map [ the-brand ->
+      (word [ brand-name ] of the-brand " " [ discount-timer ] of the-brand "d") ]
+    sale
+end
+
+to-report price-list [ lo hi ]
+  ; brands lo..hi with prices; a discounted brand shows its sale price
+  let text ""
+  foreach sort brands with [ brand-id >= lo and brand-id <= hi ]
+    [ the-brand ->
+      if text != "" [ set text (word text "    ") ]
+      set text (word text [ price-label ] of the-brand)
+  ]
+  report text
+end
+
+to-report price-label  ; brand reporter
+  ifelse discount-timer > 0
+    [ report (word brand-name " $" precision effective-price 2 " SALE") ]
+    [ report (word brand-name " $" precision price 2) ]
+end]]></code>
+  <widgets>
+    <view x="10" wrappingAllowedX="true" y="545" frameRate="30.0" minPycor="-2" height="45" showTickCounter="true" patchSize="9.0" fontSize="10" wrappingAllowedY="true" width="45" tickCounterLabel="days" maxPycor="2" updateMode="1" maxPxcor="2" minPxcor="-2"></view>
+    <button x="10" y="10" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="85" display="setup">setup</button>
+    <button x="100" y="10" height="40" disableUntilTicks="true" forever="false" kind="Observer" width="85" display="go once">go</button>
+    <button x="190" y="10" height="40" disableUntilTicks="true" forever="true" kind="Observer" width="95" display="go">go</button>
+    <slider x="10" step="1.0" y="55" max="30.0" width="275" display="discount-days" height="50" min="1.0" direction="Horizontal" default="7.0" variable="discount-days" units="days"></slider>
+    <button x="10" y="110" height="40" disableUntilTicks="true" forever="false" kind="Observer" width="135" display="discount Zappa">discount-brand 0</button>
+    <button x="10" y="155" height="40" disableUntilTicks="true" forever="false" kind="Observer" width="135" display="discount Kova">discount-brand 1</button>
+    <button x="10" y="200" height="40" disableUntilTicks="true" forever="false" kind="Observer" width="135" display="discount Nuvo">discount-brand 2</button>
+    <button x="10" y="245" height="40" disableUntilTicks="true" forever="false" kind="Observer" width="135" display="discount Fizzo">discount-brand 3</button>
+    <button x="150" y="110" height="40" disableUntilTicks="true" forever="false" kind="Observer" width="135" display="discount Blip">discount-brand 4</button>
+    <button x="150" y="155" height="40" disableUntilTicks="true" forever="false" kind="Observer" width="135" display="discount Gusto">discount-brand 5</button>
+    <button x="150" y="200" height="40" disableUntilTicks="true" forever="false" kind="Observer" width="135" display="discount Vibe">discount-brand 6</button>
+    <button x="150" y="245" height="40" disableUntilTicks="true" forever="false" kind="Observer" width="135" display="discount Munch">discount-brand 7</button>
+    <monitor x="10" precision="2" y="290" height="60" fontSize="11" width="135" display="total sales ($)">total-sales</monitor>
+    <monitor x="150" precision="2" y="290" height="60" fontSize="11" width="135" display="total profit ($)">total-profit</monitor>
+    <monitor x="10" precision="0" y="340" height="60" fontSize="11" width="135" display="% broke today">broke-customers / num-customers * 100</monitor>
+    <monitor x="10" precision="0" y="390" height="60" fontSize="11" width="275" display="on sale now">brands-on-sale</monitor>
+    <monitor x="10" precision="0" y="440" height="60" fontSize="11" width="275" display="prices (1-4)">price-list 0 3</monitor>
+    <monitor x="10" precision="0" y="490" height="60" fontSize="11" width="275" display="prices (5-8)">price-list 4 7</monitor>
+    <plot x="295" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="% of daily units" y="10" xMin="0.0" height="250" legend="true" xMax="30.0" yMin="0.0" width="445" xAxis="days" display="Market Share per Brand (%)">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Zappa" color="-14714956" legend="true">
+        <setup></setup>
+        <update>plot brand-share 0</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Kova" color="-33010" legend="true">
+        <setup></setup>
+        <update>plot brand-share 1</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Nuvo" color="-13852628" legend="true">
+        <setup></setup>
+        <update>plot brand-share 2</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Fizzo" color="-2742488" legend="true">
+        <setup></setup>
+        <update>plot brand-share 3</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Blip" color="-7051331" legend="true">
+        <setup></setup>
+        <update>plot brand-share 4</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Gusto" color="-7580085" legend="true">
+        <setup></setup>
+        <update>plot brand-share 5</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Vibe" color="-1869886" legend="true">
+        <setup></setup>
+        <update>plot brand-share 6</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Munch" color="-15221041" legend="true">
+        <setup></setup>
+        <update>plot brand-share 7</update>
+      </pen>
+    </plot>
+    <plot x="295" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="cumulative $ sales" y="270" xMin="0.0" height="250" legend="true" xMax="30.0" yMin="0.0" width="445" xAxis="days" display="Cumulative Sales per Brand ($)">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Zappa" color="-14714956" legend="true">
+        <setup></setup>
+        <update>plot item 0 brand-sales</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Kova" color="-33010" legend="true">
+        <setup></setup>
+        <update>plot item 1 brand-sales</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Nuvo" color="-13852628" legend="true">
+        <setup></setup>
+        <update>plot item 2 brand-sales</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Fizzo" color="-2742488" legend="true">
+        <setup></setup>
+        <update>plot item 3 brand-sales</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Blip" color="-7051331" legend="true">
+        <setup></setup>
+        <update>plot item 4 brand-sales</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Gusto" color="-7580085" legend="true">
+        <setup></setup>
+        <update>plot item 5 brand-sales</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Vibe" color="-1869886" legend="true">
+        <setup></setup>
+        <update>plot item 6 brand-sales</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Munch" color="-15221041" legend="true">
+        <setup></setup>
+        <update>plot item 7 brand-sales</update>
+      </pen>
+    </plot>
+    <plot x="295" autoPlotX="true" yMax="100.0" autoPlotY="true" yAxis="cumulative $ profit" y="530" xMin="0.0" height="250" legend="true" xMax="30.0" yMin="0.0" width="445" xAxis="days" display="Cumulative Profit per Brand ($)">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="Zappa" color="-14714956" legend="true">
+        <setup></setup>
+        <update>plot item 0 brand-profit</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Kova" color="-33010" legend="true">
+        <setup></setup>
+        <update>plot item 1 brand-profit</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Nuvo" color="-13852628" legend="true">
+        <setup></setup>
+        <update>plot item 2 brand-profit</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Fizzo" color="-2742488" legend="true">
+        <setup></setup>
+        <update>plot item 3 brand-profit</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Blip" color="-7051331" legend="true">
+        <setup></setup>
+        <update>plot item 4 brand-profit</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Gusto" color="-7580085" legend="true">
+        <setup></setup>
+        <update>plot item 5 brand-profit</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Vibe" color="-1869886" legend="true">
+        <setup></setup>
+        <update>plot item 6 brand-profit</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Munch" color="-15221041" legend="true">
+        <setup></setup>
+        <update>plot item 7 brand-profit</update>
+      </pen>
+    </plot>
+    <plot x="295" autoPlotX="false" yMax="60.0" autoPlotY="true" yAxis="units on shelf" y="790" xMin="0.0" height="250" legend="false" xMax="8.0" yMin="0.0" width="445" xAxis="brand" display="Current Shelf Stock">
+      <setup></setup>
+      <update>clear-plot</update>
+      <pen interval="1.0" mode="1" display="stock" color="-7500403" legend="false">
+        <setup></setup>
+        <update><![CDATA[foreach sort brands [ the-brand -> set-plot-pen-color bar-color the-brand plotxy [ brand-id ] of the-brand [ stock ] of the-brand ]]]></update>
+      </pen>
+    </plot>
+  </widgets>
+  <info><![CDATA[## WHAT IS IT?
+
+A simple model of habit and brand loyalty. 200 customers with small daily budgets repeatedly buy from one product category stocked by 8 competing brands (Zappa, Kova, Nuvo, Fizzo, Blip, Gusto, Vibe, Munch). Each customer keeps a private loyalty score for every brand; those scores build when a brand is bought, fade when it is not, and steer the next choice - so brands drift, a leader emerges, and loyalties lock in or switch, none of it hard-coded.
+
+It is the single-category version of a brand-choice model: the classic setting (Guadagni & Little calibrated their model on one category, coffee), stripped of anything not central to loyalty dynamics.
+
+
+## HOW IT WORKS
+
+Each customer holds one **loyalty score** per brand (any number, starting near zero) and one **shopping probability**.
+
+Each tick is one day:
+
+1. **Deliveries.** Any order in transit counts down and arrives when its lead time expires.
+
+2. **Budget.** Each wallet refills to a personal base (5-15 dollars) give or take 10% noise.
+
+3. **Shopping.** With probability equal to its shopping habit, a customer makes a trip. Choice is **habitual by default**: each in-stock brand gets a softmax weight `exp(beta-loyalty x score)`, competing with a fixed-weight no-buy option, and one is drawn in proportion to its weight - so the strongest score usually wins and price is ignored. On a minority of occasions the customer **deliberates**, adding `beta-price x price-satisfaction` so price re-enters; this fires with probability `deliberation-prob`, and always when its favourite brand is out of stock. A chosen brand is bought in a quantity of 1..`max-units`, subject to stock and money.
+
+4. **Learning.** A purchase carries a **reward** in [0,1], blended from how cheap the brand was and how much of the wanted amount was bought. The chosen brand's score moves by `loyalty-gain x (reward - reward-neutral)` - up if satisfying, down if not - and after a satisfying buy the rivals' scores drop a little. Getting the wanted amount raises the shopping habit; falling short lowers it.
+
+5. **Forgetting.** Every score then fades toward zero by a small fraction, so a habit lasts only if it keeps being renewed. No lead is permanent, and a shock can unseat a leader.
+
+6. **Reordering.** Each brand restocks with an order-up-to rule and a random 1-5 day lead time.
+
+The choice is plain reinforcement learning: scores plus a softmax, with no probabilities or log-odds in between. Note the shop pays 70% of the *catalog* price per unit and a sale cuts the shelf price 35%, so a discounted unit sells **below cost** - volume rises but margin turns negative.
+
+
+## HOW TO USE IT
+
+Press **setup**, then **go**. To run a sale, press a brand button; **discount-days** sets how long it lasts. Nothing goes on sale on its own.
+
+**Market Share per Brand (%)** - each brand's share of the day's units. Watch a leader pull ahead.
+
+**Cumulative Sales / Profit per Brand ($)** - running totals. Line them up against a sale: a brand's sales line steepens while it is discounted, but its profit line stalls or dips, because discounted units sell below cost.
+
+**Current Shelf Stock** - units per brand; a bar turns **magenta** while that brand is on sale.
+
+Monitors show total sales and profit, **% broke today** (customers who wanted to shop but could not afford it), **on sale now**, and each brand's price (with a SALE flag when discounted).
+
+
+## THINGS TO NOTICE
+
+A leader **emerges** even though no rule picks one, and running setup again can crown a different brand - the outcome turns on early, chance events (**path dependence**). With eight brands the market stays competitive: expect a leader around a quarter to a third of sales, not a runaway monopoly.
+
+A sale trades volume for margin: it lifts a brand's share and cumulative sales while its cumulative profit line flattens or falls. Because forgetting loosens old habits, some customers tempted by the sale keep the brand afterwards, so the effect can outlive the discount.
+
+Shelf stock shows the classic bullwhip: a run empties a shelf, a big reorder overshoots, then drains again.
+
+
+## THINGS TO TRY
+
+Set `loyalty-forget-rate` to 0 and the market **freezes** after an early transient: scores never fade, so whoever leads early stays. Raise it and loyalties churn.
+
+Lower `deliberation-prob` toward 0 for almost purely habitual customers whose favourites lock in early; raise it to let price and stockouts stir the market. Push `beta-loyalty` up for stickier, more winner-take-all brands, or `loyalty-gain` up for faster lock-in.
+
+Put a brand on sale and watch its share climb while the gap opens between its sales and profit lines. Try deeper (`brand-discount-rate`) or longer (`discount-days`) sales.
+
+Lower `num-brands` for a clearer winner (fewer brands split the market less); cut the budgets to make % broke climb.
+
+
+## EXTENDING THE MODEL
+
+Add word-of-mouth: nudge a customer's scores toward those of others, so bandwagons can form - the one large mechanism left out. Draw the personal parameters (forgetting, loyalty gain, deliberation) per customer, so habitual anchors and restless switchers coexist. Or restore several categories sharing one wallet, to study how a tight budget makes categories compete.
+
+
+## NETLOGO FEATURES
+
+Brands and customers are two invisible breeds. Each customer's loyalties are a plain list of scores, one per brand. Choice is a softmax turned into a draw by a small reusable `weighted-pick` reporter, with the no-buy option carried as a `nobody` entry in the option list. Reinforcement and forgetting are ordinary arithmetic on the scores - no `logit`/`logistic` - and the favourite brand is just `position (max loyalties) loyalties`.
+
+
+## RELATED MODELS
+
+* Simple Economy - money changing hands under simple rules.
+* El Farol - agents adapting choice probabilities from experience.
+
+
+## CREDITS AND REFERENCES
+
+The habitual-by-default rule, reward-scaled loyalty, and forgetting follow the habit-as-reinforcement-learning account:
+
+* Wood, W., & Rünger, D. (2016). Psychology of habit. *Annual Review of Psychology, 67*, 289-314.
+* Judah, G., Gardner, B., Kenward, M. G., DeStavola, B., & Michie, S. (2018). Exploratory study of the impact of perceived reward on habit formation. *BMC Psychology, 6*, 62.
+
+The loyalty-as-smoothed-past-purchases mechanism descends from Guadagni, P. M., & Little, J. D. C. (1983), and the self-reinforcing lock-in it produces from Arthur, W. B. (1989). Choice follows the multinomial-logit tradition (McFadden); the supply oscillation reproduces the Beer Distribution Game (Sterman, 1989).
+
+NetLogo:
+
+* Wilensky, U. (1999). NetLogo. Center for Connected Learning and Computer-Based Modeling, Northwestern University, Evanston, IL. http://ccl.northwestern.edu/netlogo/]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup
+repeat simulation-days [ go ]</previewCommands>
+</model>
