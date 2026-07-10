@@ -127,6 +127,7 @@ to setup-customers
   ask customers [
     set last-cafe one-of cafes
     move-near-cafe last-cafe
+    show-turtle
   ]
 end
 

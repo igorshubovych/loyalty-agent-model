@@ -194,6 +194,7 @@ to setup-friendships
     set thickness 0.05
     hide-link
   ]
+  display
 end
 
 to-report preferential-choice [candidates]
@@ -375,7 +376,7 @@ to recommend-cafe [chosen-cafe]
 
   ask friendship-neighbors [
     set recommended-cafe chosen-cafe
-    set recommendation-strength recommendation-strength + 2
+    set recommendation-strength recommendation-strength + 10
 
     if recommendation-strength > 6 [
       set recommendation-strength 6
@@ -407,10 +408,8 @@ to set-cafe-color
   if loyalty-type = 4 [ set color red ]
 end]]></code>
   <widgets>
-    <view x="368" wrappingAllowedX="true" y="10" frameRate="30.0" minPycor="-16" height="434" showTickCounter="true" patchSize="13.0" fontSize="10" wrappingAllowedY="true" width="434" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
+    <view x="368" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="-16" height="434" showTickCounter="true" patchSize="13.0" fontSize="10" wrappingAllowedY="false" width="434" tickCounterLabel="ticks" maxPycor="16" updateMode="0" maxPxcor="16" minPxcor="-16"></view>
     <button x="25" y="45" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="55">setup</button>
-    <button x="25" y="95" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
-    <monitor x="20" precision="17" y="380" height="60" fontSize="11" width="100" display="Total visits">sum [visits] of cafes</monitor>
     <plot x="875" autoPlotX="true" yMax="10.0" autoPlotY="true" y="25" xMin="0.0" height="175" legend="false" xMax="10.0" yMin="0.0" width="230" display="Visits by cafe">
       <setup></setup>
       <update></update>
@@ -502,13 +501,15 @@ if total-visits > 0 [
         <update>plot ([visits] of one-of cafes with [cafe-id = 4] / total-visits) * 100</update>
       </pen>
     </plot>
-    <monitor x="15" precision="17" y="495" height="60" fontSize="11" width="135" display="Most profitable cafe">[cafe-id] of max-one-of cafes [profit]</monitor>
-    <monitor x="175" precision="17" y="495" height="60" fontSize="11" width="135" display="Most visited cafe">[cafe-id] of max-one-of cafes [visits]</monitor>
-    <monitor x="140" precision="17" y="380" height="60" fontSize="11" width="100" display="Satisfaction (mean)">mean [satisfaction] of customers</monitor>
-    <monitor x="255" precision="17" y="380" height="60" fontSize="11" width="100" display="Lost visitors">sum [lost-visits] of customers</monitor>
-    <monitor x="20" precision="17" y="170" height="60" fontSize="11" width="100" display="Total revenue">sum [revenue] of cafes</monitor>
-    <monitor x="155" precision="7" y="170" height="60" fontSize="11" width="190" display="Total profit">sum [profit] of cafes</monitor>
-    <monitor x="15" precision="10" y="250" height="60" fontSize="11" width="150" display="Loyalty cost (total)">sum [loyalty-cost] of cafes</monitor>
+    <button x="105" y="45" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="55">go</button>
+    <monitor x="25" precision="17" y="105" height="60" fontSize="11" width="100" display="Total revenue">sum [revenue] of cafes</monitor>
+    <monitor x="25" precision="17" y="430" height="60" fontSize="11" width="135" display="Most profitable cafe">[cafe-id] of max-one-of cafes [profit]</monitor>
+    <monitor x="25" precision="17" y="315" height="60" fontSize="11" width="100" display="Total visits">sum [visits] of cafes</monitor>
+    <monitor x="25" precision="10" y="185" height="60" fontSize="11" width="150" display="Loyalty cost (total)">sum [loyalty-cost] of cafes</monitor>
+    <monitor x="165" precision="7" y="105" height="60" fontSize="11" width="190" display="Total profit">sum [profit] of cafes</monitor>
+    <monitor x="135" precision="17" y="315" height="60" fontSize="11" width="100" display="Satisfaction (mean)">mean [satisfaction] of customers</monitor>
+    <monitor x="245" precision="17" y="315" height="60" fontSize="11" width="100" display="Lost visitors">sum [lost-visits] of customers</monitor>
+    <monitor x="185" precision="17" y="430" height="60" fontSize="11" width="135" display="Most visited cafe">[cafe-id] of max-one-of cafes [visits]</monitor>
   </widgets>
   <info>## WHAT IS IT?
 
